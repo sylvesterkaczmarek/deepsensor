@@ -1,0 +1,52 @@
+name: Apply ERA5 anonymous GCS fix
+
+on:
+  push:
+    branches: [automation/apply-era5-anon-fix]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix-era5-anonymous-gcs
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Apply fix and regression test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          source_path = Path('deepsensor/data/sources.py')
+          source = source_path.read_text()
+          old = '        era5_zarr = xr.open_zarr(source, consolidated=True, chunks={"time": 48})\n'
+          new = '''        era5_zarr = xr.open_zarr(\n            source,\n            consolidated=True,\n            chunks={"time": 48},\n            storage_options={"token": "anon"},\n        )\n'''
+          if source.count(old) != 1:
+              raise RuntimeError(f'Expected exactly one ERA5 open_zarr call, found {source.count(old)}')
+          source_path.write_text(source.replace(old, new))
+
+          Path('tests/test_sources.py').write_text('''from unittest import mock\nimport unittest\n\nfrom deepsensor.data import sources\n\n\nclass TestDataSources(unittest.TestCase):\n    def test_era5_uses_anonymous_gcs_access(self):\n        with mock.patch.object(\n            sources.xr, "open_zarr", side_effect=RuntimeError("stop after open")\n        ) as open_zarr:\n            with self.assertRaisesRegex(RuntimeError, "stop after open"):\n                sources._get_era5_reanalysis_data_parallel(\n                    date_range=("2024-01-01", "2024-01-02"),\n                    var_IDs=["2m_temperature"],\n                    freq="H",\n                    extent="global",\n                    cache=False,\n                )\n\n        args, kwargs = open_zarr.call_args\n        self.assertTrue(args[0].startswith("gs://gcp-public-data-arco-era5/"))\n        self.assertEqual(kwargs["storage_options"], {"token": "anon"})\n\n\nif __name__ == "__main__":\n    unittest.main()\n''')
+          PY
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test,dev]'
+      - name: Run targeted test
+        run: python -m pytest tests/test_sources.py -q
+      - name: Run lint
+        run: ruff check deepsensor/data/sources.py tests/test_sources.py
+      - name: Check diff
+        run: git diff --check
+      - name: Commit tested fix
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add deepsensor/data/sources.py tests/test_sources.py
+          git commit -m 'Use anonymous GCS access for ERA5 data'
+          git push origin HEAD:fix-era5-anonymous-gcs
